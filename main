@@ -1,0 +1,202 @@
+import asyncio
+import os
+import logging
+import re
+import json
+from pathlib import Path
+from playwright.async_api import async_playwright, Download
+from undetected_playwright import stealth_async
+
+# ======================================================
+# GENERAL SETTINGS
+# ======================================================
+GROK_URL = "https://grok.com/imagine"
+DOWNLOAD_ROOT = "./videos"
+VIDEO_SCRIPTS_FOLDER = "./video_scripts"
+LOG_FILE = "automation.log"
+CHECK_INTERVAL = 3000
+MAX_WAIT = 420000
+AFTER_DOWNLOAD_WAIT = 9000
+BETWEEN_SCENES_WAIT = 7000
+BETWEEN_VIDEOS_WAIT = 18000
+MAX_RETRIES = 3
+HEADLESS = False
+WINDOW_WIDTH = 1366
+WINDOW_HEIGHT = 768
+
+USER_DATA_DIR = "./user_data"
+SLOW_MO = 20
+
+LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-blink-features=AutomationControlled",
+    "--start-maximized",
+    "--disable-web-security",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--disable-infobars",
+    "--window-size=1366,768",
+    "--disable-extensions",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+    "--ignore-certificate-errors",
+    "--disable-features=TranslateUI",
+    "--metrics-recording-only",
+    "--disable-default-apps",
+    "--mute-audio"
+]
+
+# SELECTORS (تم تصحيح aria-label)
+GROK_SETTING_RATIO_BUTTON = 'button[data-testid="ratio-vertical"]'
+GROK_SETTING_VIDEO_MODE_BUTTON = 'button[data-testid="mode-video"]'
+GROK_SETTING_QUALITY_BUTTON = 'button[data-testid="quality-high"]'
+GROK_SETTING_WATERMARK_OFF = 'button[data-testid="watermark-off"]'
+GROK_SETTING_MUTE_ON = 'button[data-testid="mute-on"]'
+
+PAGE_READY_SELECTOR = 'p[data-placeholder="Tapez pour imaginer"]'
+INPUT_SELECTOR = 'p[data-placeholder="Tapez pour imaginer"]'
+CANCEL_BUTTON_SELECTOR = 'button:has-text("Annuler la vidéo")'
+DOWNLOAD_BUTTON_SELECTOR = 'button[aria-label="Télécharger"]'  # تم التصحيح
+
+SCENE_FILENAME_PATTERN = "scene_%INDEX%.mp4"
+SANITIZE_FILENAMES = True
+DEBUG_MODE = True
+SAVE_HTML_ON_ERROR = True
+SCREENSHOT_ON_ERROR = True
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.DEBUG if DEBUG_MODE else logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logging.getLogger().addHandler(console)
+
+def sanitize_filename(name: str) -> str:
+    if not SANITIZE_FILENAMES:
+        return name
+    return re.sub(r'[<>:"/\\|?*]', '_', name.strip())
+
+async def apply_grok_settings(page):
+    print("🔧 تطبيق إعدادات Grok (اختياري)...")
+    settings = [
+        GROK_SETTING_RATIO_BUTTON,
+        GROK_SETTING_VIDEO_MODE_BUTTON,
+        GROK_SETTING_QUALITY_BUTTON,
+        GROK_SETTING_WATERMARK_OFF,
+        GROK_SETTING_MUTE_ON
+    ]
+    for selector in settings:
+        try:
+            await page.click(selector, timeout=10000)
+            print(f"✅ تم: {selector}")
+        except:
+            print(f"⏭️ تجاهل (مفعل بالفعل): {selector}")
+    await asyncio.sleep(3)
+
+async def generate_scene(page, prompt: str, scene_path: str, index: int, title: str):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            print(f"🎥 توليد المشهد {index} - محاولة {attempt}")
+            await page.locator(INPUT_SELECTOR).evaluate("el => el.innerText = ''")
+            await page.click(INPUT_SELECTOR)
+            await page.keyboard.type(prompt, delay=50)
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(5)
+
+            print("⏳ انتظار التوليد...")
+            await page.wait_for_selector(CANCEL_BUTTON_SELECTOR, timeout=60000)
+            print("⏳ انتظار زر التحميل...")
+            await page.wait_for_selector(DOWNLOAD_BUTTON_SELECTOR, timeout=MAX_WAIT)
+
+            async with page.expect_download(timeout=90000) as download_info:
+                await page.click(DOWNLOAD_BUTTON_SELECTOR)
+            download = await download_info.value
+            await download.save_as(scene_path)
+            
+            print(f"✅ تم التحميل: {scene_path}")
+            await asyncio.sleep(AFTER_DOWNLOAD_WAIT / 1000)
+            return True
+        except Exception as e:
+            print(f"❌ فشل (محاولة {attempt}): {e}")
+            if SCREENSHOT_ON_ERROR:
+                await page.screenshot(path=f"error_{title}_{index}_{attempt}.png")
+            if attempt == MAX_RETRIES:
+                raise
+            await asyncio.sleep(15)
+    return False
+
+async def process_video_script(page, script_path: str):
+    title = sanitize_filename(Path(script_path).stem)
+    video_dir = os.path.join(DOWNLOAD_ROOT, title)
+    if os.path.exists(video_dir):
+        print(f"⏭️ تخطي {title}")
+        return
+    os.makedirs(video_dir, exist_ok=True)
+    prompts = [line.strip() for line in open(script_path, encoding="utf-8") if line.strip()]
+    if not prompts:
+        print("⚠️ ملف فارغ")
+        return
+    print(f"🚀 بدء {title} ({len(prompts)} مشهد)")
+    for index, prompt in enumerate(prompts, 1):
+        scene_path = os.path.join(video_dir, SCENE_FILENAME_PATTERN.replace("%INDEX%", f"{index:04d}"))
+        await generate_scene(page, prompt, scene_path, index, title)
+        await asyncio.sleep(BETWEEN_SCENES_WAIT / 1000)
+    print(f"🎉 اكتمل {title}")
+
+async def main():
+    print("🚀 بدء السكريبت...")
+    os.makedirs(VIDEO_SCRIPTS_FOLDER, exist_ok=True)
+    os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
+    print(f"📁 المجلدات جاهزة: {VIDEO_SCRIPTS_FOLDER} و {DOWNLOAD_ROOT}")
+
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            USER_DATA_DIR,
+            headless=HEADLESS,
+            slow_mo=SLOW_MO,
+            viewport={"width": WINDOW_WIDTH, "height": WINDOW_HEIGHT},
+            args=LAUNCH_ARGS
+        )
+        context.set_default_navigation_timeout(90000)
+        context.set_default_timeout(60000)
+        
+        page = context.pages[0] if context.pages else await context.new_page()
+        await stealth_async(page)
+        await page.add_init_script("""() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            window.chrome = { runtime: {}, app: {}, webstore: {} };
+            Object.defineProperty(navigator, 'languages', { get: () => ['fr-FR', 'fr'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+        }""")
+        
+        if os.path.exists("cookies.json"):
+            with open("cookies.json", "r", encoding="utf-8") as f:
+                cookies = json.load(f)
+            await context.add_cookies(cookies)
+  print(f"🍪 تم حقن {len(cookies)} كوكي")
+        else:
+            print("⚠️ لا يوجد cookies.json – المرة الأولى عادية")
+
+        print("🌐 فتح Grok Imagine...")
+        await page.goto(GROK_URL, timeout=90000)
+        await page.wait_for_load_state('networkidle', timeout=MAX_WAIT)
+        await page.wait_for_selector(PAGE_READY_SELECTOR, timeout=MAX_WAIT)
+        print("✅ الصفحة جاهزة")
+
+        await apply_grok_settings(page)
+        
+        while True:
+            script_files = [f for f in os.listdir(VIDEO_SCRIPTS_FOLDER) if f.lower().endswith(".txt")]
+            if script_files:
+                print(f"📂 وجد {len(script_files)} ملف جديد")
+                for script_file in script_files:
+                    await process_video_script(page, os.path.join(VIDEO_SCRIPTS_FOLDER, script_file))
+            else:
+                print("⏳ لا توجد ملفات .txt... التحقق كل 3 ثواني")
+            await asyncio.sleep(CHECK_INTERVAL / 1000)
+
+if __name__ == "__main__":
+    asyncio.run(main())
