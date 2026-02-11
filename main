@@ -65,8 +65,13 @@ ENABLE_GROK_SETTING_QUALITY = True
 ENABLE_GROK_SETTING_WATERMARK_OFF = True
 ENABLE_GROK_SETTING_MUTE_ON = True
 
-PAGE_READY_SELECTOR = 'p[data-placeholder="Tapez pour imaginer"]'
-INPUT_SELECTOR = 'p[data-placeholder="Tapez pour imaginer"]'
+PAGE_READY_SELECTORS = [
+    'div[contenteditable="true"][role="textbox"]',
+    'textarea[placeholder*="Imagine"]',
+    'textarea[placeholder*="imaginer"]',
+    'p[data-placeholder*="imag"]'
+]
+INPUT_SELECTOR = 'div[contenteditable="true"][role="textbox"], textarea[placeholder*="Imagine"], textarea[placeholder*="imaginer"]'
 CANCEL_BUTTON_SELECTOR = 'button:has-text("Annuler la vidéo")'
 DOWNLOAD_BUTTON_SELECTOR = 'button[aria-label="Télécharger"]'  # تم التصحيح
 
@@ -151,6 +156,40 @@ async def smart_fill(page, selector: str, text: str, *, timeout: int = 30000, la
 
     raise RuntimeError(f"فشل الملء للعنصر: {label or selector}. السبب: {last_error}") from last_error
 
+
+
+
+async def smart_wait_for_any(page, selectors: List[str], *, timeout: int = MAX_WAIT, label: str = ""):
+    """انتظر أول Selector متاح من قائمة (مفيد لاختلاف لغة الواجهة)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + (timeout / 1000)
+    last_error = None
+
+    while loop.time() < deadline:
+        for selector in selectors:
+            remaining_ms = max(200, int((deadline - loop.time()) * 1000))
+            try:
+                handle = await page.wait_for_selector(selector, timeout=min(2000, remaining_ms), state="visible")
+                if handle:
+                    return selector
+            except Exception as error:
+                last_error = error
+        await asyncio.sleep(0.4)
+
+    raise RuntimeError(f"فشل انتظار أي عنصر جاهزية: {label or selectors}. السبب: {last_error}") from last_error
+
+
+async def wait_for_grok_ready(page):
+    """جاهزية مرنة لصفحة Grok بدون التعليق عند networkidle."""
+    print("⏳ انتظار جاهزية الصفحة...")
+    await page.wait_for_load_state("domcontentloaded", timeout=90000)
+    matched_selector = await smart_wait_for_any(
+        page,
+        PAGE_READY_SELECTORS,
+        timeout=MAX_WAIT,
+        label="جاهزية صفحة Grok"
+    )
+    print(f"✅ الصفحة جاهزة (selector: {matched_selector})")
 
 async def apply_grok_settings(page):
     print("🔧 تطبيق إعدادات Grok (اختياري)...")
@@ -356,10 +395,9 @@ async def main():
             print(f"🍪 تم حقن {len(cookies)} كوكي")
 
         print("🌐 فتح Grok Imagine...")
-        await page.goto(GROK_URL, timeout=90000)
-        await page.wait_for_load_state('networkidle', timeout=MAX_WAIT)
-        await smart_wait_for(page, PAGE_READY_SELECTOR, timeout=MAX_WAIT, label="جاهزية صفحة Grok")
-        print("✅ الصفحة جاهزة")
+        await page.goto(GROK_URL, timeout=90000, wait_until="domcontentloaded")
+        print(f"ℹ️ عنوان الصفحة الحالية: {page.url}")
+        await wait_for_grok_ready(page)
 
         await apply_grok_settings(page)
 
