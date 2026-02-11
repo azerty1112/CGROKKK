@@ -26,6 +26,7 @@ WINDOW_HEIGHT = 768
 
 USER_DATA_DIR = "./user_data"
 SLOW_MO = 20
+INTERACTION_RETRIES = 3
 
 LAUNCH_ARGS = [
     "--no-sandbox",
@@ -74,10 +75,72 @@ console = logging.StreamHandler()
 console.setLevel(logging.INFO)
 logging.getLogger().addHandler(console)
 
+
 def sanitize_filename(name: str) -> str:
     if not SANITIZE_FILENAMES:
         return name
     return re.sub(r'[<>:"/\\|?*]', '_', name.strip())
+
+
+async def smart_wait_for(page, selector: str, *, timeout: int = MAX_WAIT, state: str = "visible", label: str = ""):
+    last_error = None
+    for attempt in range(1, INTERACTION_RETRIES + 1):
+        try:
+            return await page.wait_for_selector(selector, timeout=timeout, state=state)
+        except Exception as error:
+            last_error = error
+            print(f"⚠️ انتظار فشل ({label or selector}) - محاولة {attempt}/{INTERACTION_RETRIES}")
+            await asyncio.sleep(1.2 * attempt)
+    raise RuntimeError(f"فشل الانتظار للعنصر: {label or selector}. السبب: {last_error}") from last_error
+
+
+async def smart_click(page, selector: str, *, timeout: int = 30000, label: str = ""):
+    last_error = None
+    locator = page.locator(selector).first
+
+    for attempt in range(1, INTERACTION_RETRIES + 1):
+        try:
+            await smart_wait_for(page, selector, timeout=timeout, label=label)
+            await locator.scroll_into_view_if_needed(timeout=timeout)
+            await locator.hover(timeout=timeout)
+            await locator.click(timeout=timeout)
+            return
+        except Exception as error:
+            last_error = error
+            print(f"⚠️ نقر عادي فشل ({label or selector}) - محاولة {attempt}/{INTERACTION_RETRIES}")
+            try:
+                await locator.click(timeout=timeout, force=True)
+                return
+            except Exception:
+                await asyncio.sleep(0.8 * attempt)
+
+    raise RuntimeError(f"فشل النقر على العنصر: {label or selector}. السبب: {last_error}") from last_error
+
+
+async def smart_fill(page, selector: str, text: str, *, timeout: int = 30000, label: str = ""):
+    last_error = None
+    locator = page.locator(selector).first
+
+    for attempt in range(1, INTERACTION_RETRIES + 1):
+        try:
+            await smart_wait_for(page, selector, timeout=timeout, label=label)
+            await locator.scroll_into_view_if_needed(timeout=timeout)
+            await locator.click(timeout=timeout)
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.type(text, delay=50)
+            return
+        except Exception as error:
+            last_error = error
+            print(f"⚠️ ملء فشل ({label or selector}) - محاولة {attempt}/{INTERACTION_RETRIES}")
+            try:
+                await locator.fill(text, timeout=timeout)
+                return
+            except Exception:
+                await asyncio.sleep(0.8 * attempt)
+
+    raise RuntimeError(f"فشل الملء للعنصر: {label or selector}. السبب: {last_error}") from last_error
+
 
 async def apply_grok_settings(page):
     print("🔧 تطبيق إعدادات Grok (اختياري)...")
@@ -90,32 +153,31 @@ async def apply_grok_settings(page):
     ]
     for selector in settings:
         try:
-            await page.click(selector, timeout=10000)
+            await smart_click(page, selector, timeout=10000, label=f"Grok setting: {selector}")
             print(f"✅ تم: {selector}")
-        except:
+        except Exception:
             print(f"⏭️ تجاهل (مفعل بالفعل): {selector}")
     await asyncio.sleep(3)
+
 
 async def generate_scene(page, prompt: str, scene_path: str, index: int, title: str):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             print(f"🎥 توليد المشهد {index} - محاولة {attempt}")
-            await page.locator(INPUT_SELECTOR).evaluate("el => el.innerText = ''")
-            await page.click(INPUT_SELECTOR)
-            await page.keyboard.type(prompt, delay=50)
+            await smart_fill(page, INPUT_SELECTOR, prompt, timeout=30000, label="حقل البرومبت")
             await page.keyboard.press("Enter")
             await asyncio.sleep(5)
 
             print("⏳ انتظار التوليد...")
-            await page.wait_for_selector(CANCEL_BUTTON_SELECTOR, timeout=60000)
+            await smart_wait_for(page, CANCEL_BUTTON_SELECTOR, timeout=60000, label="زر إلغاء الفيديو")
             print("⏳ انتظار زر التحميل...")
-            await page.wait_for_selector(DOWNLOAD_BUTTON_SELECTOR, timeout=MAX_WAIT)
+            await smart_wait_for(page, DOWNLOAD_BUTTON_SELECTOR, timeout=MAX_WAIT, label="زر التحميل")
 
             async with page.expect_download(timeout=90000) as download_info:
-                await page.click(DOWNLOAD_BUTTON_SELECTOR)
-            download = await download_info.value
+                await smart_click(page, DOWNLOAD_BUTTON_SELECTOR, timeout=20000, label="تنزيل المشهد")
+            download: Download = await download_info.value
             await download.save_as(scene_path)
-            
+
             print(f"✅ تم التحميل: {scene_path}")
             await asyncio.sleep(AFTER_DOWNLOAD_WAIT / 1000)
             return True
@@ -128,6 +190,7 @@ async def generate_scene(page, prompt: str, scene_path: str, index: int, title: 
             await asyncio.sleep(15)
     return False
 
+
 async def process_video_script(page, script_path: str):
     title = sanitize_filename(Path(script_path).stem)
     video_dir = os.path.join(DOWNLOAD_ROOT, title)
@@ -135,7 +198,8 @@ async def process_video_script(page, script_path: str):
         print(f"⏭️ تخطي {title}")
         return
     os.makedirs(video_dir, exist_ok=True)
-    prompts = [line.strip() for line in open(script_path, encoding="utf-8") if line.strip()]
+    with open(script_path, encoding="utf-8") as script_file:
+        prompts = [line.strip() for line in script_file if line.strip()]
     if not prompts:
         print("⚠️ ملف فارغ")
         return
@@ -145,6 +209,7 @@ async def process_video_script(page, script_path: str):
         await generate_scene(page, prompt, scene_path, index, title)
         await asyncio.sleep(BETWEEN_SCENES_WAIT / 1000)
     print(f"🎉 اكتمل {title}")
+
 
 async def main():
     print("🚀 بدء السكريبت...")
@@ -162,7 +227,7 @@ async def main():
         )
         context.set_default_navigation_timeout(90000)
         context.set_default_timeout(60000)
-        
+
         page = context.pages[0] if context.pages else await context.new_page()
         await stealth_async(page)
         await page.add_init_script("""() => {
@@ -171,23 +236,23 @@ async def main():
             Object.defineProperty(navigator, 'languages', { get: () => ['fr-FR', 'fr'] });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
         }""")
-        
+
         if os.path.exists("cookies.json"):
             with open("cookies.json", "r", encoding="utf-8") as f:
                 cookies = json.load(f)
             await context.add_cookies(cookies)
-  print(f"🍪 تم حقن {len(cookies)} كوكي")
+            print(f"🍪 تم حقن {len(cookies)} كوكي")
         else:
             print("⚠️ لا يوجد cookies.json – المرة الأولى عادية")
 
         print("🌐 فتح Grok Imagine...")
         await page.goto(GROK_URL, timeout=90000)
         await page.wait_for_load_state('networkidle', timeout=MAX_WAIT)
-        await page.wait_for_selector(PAGE_READY_SELECTOR, timeout=MAX_WAIT)
+        await smart_wait_for(page, PAGE_READY_SELECTOR, timeout=MAX_WAIT, label="جاهزية صفحة Grok")
         print("✅ الصفحة جاهزة")
 
         await apply_grok_settings(page)
-        
+
         while True:
             script_files = [f for f in os.listdir(VIDEO_SCRIPTS_FOLDER) if f.lower().endswith(".txt")]
             if script_files:
@@ -197,6 +262,7 @@ async def main():
             else:
                 print("⏳ لا توجد ملفات .txt... التحقق كل 3 ثواني")
             await asyncio.sleep(CHECK_INTERVAL / 1000)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
