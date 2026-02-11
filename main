@@ -55,6 +55,13 @@ GROK_SETTING_QUALITY_BUTTON = 'button[data-testid="quality-high"]'
 GROK_SETTING_WATERMARK_OFF = 'button[data-testid="watermark-off"]'
 GROK_SETTING_MUTE_ON = 'button[data-testid="mute-on"]'
 
+# يمكنك تعطيل أي إعداد بجعله False
+ENABLE_GROK_SETTING_RATIO = True
+ENABLE_GROK_SETTING_VIDEO_MODE = True
+ENABLE_GROK_SETTING_QUALITY = True
+ENABLE_GROK_SETTING_WATERMARK_OFF = True
+ENABLE_GROK_SETTING_MUTE_ON = True
+
 PAGE_READY_SELECTOR = 'p[data-placeholder="Tapez pour imaginer"]'
 INPUT_SELECTOR = 'p[data-placeholder="Tapez pour imaginer"]'
 CANCEL_BUTTON_SELECTOR = 'button:has-text("Annuler la vidéo")'
@@ -145,13 +152,18 @@ async def smart_fill(page, selector: str, text: str, *, timeout: int = 30000, la
 async def apply_grok_settings(page):
     print("🔧 تطبيق إعدادات Grok (اختياري)...")
     settings = [
-        GROK_SETTING_RATIO_BUTTON,
-        GROK_SETTING_VIDEO_MODE_BUTTON,
-        GROK_SETTING_QUALITY_BUTTON,
-        GROK_SETTING_WATERMARK_OFF,
-        GROK_SETTING_MUTE_ON
+        ("ratio", GROK_SETTING_RATIO_BUTTON, ENABLE_GROK_SETTING_RATIO),
+        ("video_mode", GROK_SETTING_VIDEO_MODE_BUTTON, ENABLE_GROK_SETTING_VIDEO_MODE),
+        ("quality", GROK_SETTING_QUALITY_BUTTON, ENABLE_GROK_SETTING_QUALITY),
+        ("watermark_off", GROK_SETTING_WATERMARK_OFF, ENABLE_GROK_SETTING_WATERMARK_OFF),
+        ("mute_on", GROK_SETTING_MUTE_ON, ENABLE_GROK_SETTING_MUTE_ON)
     ]
-    for selector in settings:
+
+    for setting_name, selector, is_enabled in settings:
+        if not is_enabled:
+            print(f"⏭️ تم تعطيل الإعداد من الكونفيج: {setting_name}")
+            continue
+
         try:
             await smart_click(page, selector, timeout=10000, label=f"Grok setting: {selector}")
             print(f"✅ تم: {selector}")
