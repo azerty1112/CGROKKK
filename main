@@ -3,8 +3,9 @@ import os
 import logging
 import re
 import json
-from typing import List
+from typing import Any, Dict, List
 from pathlib import Path
+from urllib.parse import urlparse
 from playwright.async_api import async_playwright, Download
 from undetected_playwright import stealth_async
 
@@ -13,8 +14,8 @@ from undetected_playwright import stealth_async
 # ======================================================
 GROK_URL = "https://grok.com/imagine"
 BASE_DIR = Path(__file__).resolve().parent
-DOWNLOAD_ROOT = BASE_DIR / "videos"
-VIDEO_SCRIPTS_FOLDER = BASE_DIR / "video_scripts"
+DOWNLOAD_ROOT = Path(os.getenv("GROK_VIDEOS_FOLDER", r"C:\Users\PC\Desktop\GROK\videos"))
+VIDEO_SCRIPTS_FOLDER = Path(os.getenv("GROK_VIDEO_SCRIPTS_FOLDER", r"C:\Users\PC\Desktop\GROK\video_scripts"))
 LOG_FILE = "automation.log"
 CHECK_INTERVAL = 3000
 MAX_WAIT = 420000
@@ -247,6 +248,82 @@ def read_prompts(script_path: str) -> List[str]:
     raise RuntimeError(f"تعذر قراءة الملف: {script_path}. السبب: {last_error}") from last_error
 
 
+def _normalize_cookie(cookie: Dict[str, Any], default_url: str) -> Dict[str, Any] | None:
+    allowed_fields = {
+        "name", "value", "url", "domain", "path", "expires",
+        "httpOnly", "secure", "sameSite"
+    }
+    normalized = {key: cookie[key] for key in allowed_fields if key in cookie}
+
+    if not normalized.get("name") or "value" not in normalized:
+        return None
+
+    if "url" not in normalized and "domain" not in normalized:
+        normalized["url"] = default_url
+
+    if "path" not in normalized:
+        normalized["path"] = "/"
+
+    same_site = normalized.get("sameSite")
+    if isinstance(same_site, str):
+        valid_same_site = {"Strict", "Lax", "None"}
+        normalized_same_site = same_site[:1].upper() + same_site[1:].lower()
+        if normalized_same_site in valid_same_site:
+            normalized["sameSite"] = normalized_same_site
+        else:
+            normalized.pop("sameSite", None)
+
+    if "expires" in normalized and normalized["expires"] is not None:
+        try:
+            normalized["expires"] = float(normalized["expires"])
+        except (TypeError, ValueError):
+            normalized.pop("expires", None)
+
+    return normalized
+
+
+def load_cookies(cookies_file: str, target_url: str) -> List[Dict[str, Any]]:
+    cookies_path = Path(cookies_file)
+    if not cookies_path.exists():
+        print("⚠️ لا يوجد cookies.json – المرة الأولى عادية")
+        return []
+
+    try:
+        with cookies_path.open("r", encoding="utf-8") as file_obj:
+            payload = json.load(file_obj)
+    except Exception as error:
+        print(f"⚠️ تعذر قراءة cookies.json: {error}")
+        return []
+
+    if isinstance(payload, dict):
+        raw_cookies = payload.get("cookies", [])
+    elif isinstance(payload, list):
+        raw_cookies = payload
+    else:
+        print("⚠️ تنسيق cookies.json غير مدعوم")
+        return []
+
+    parsed_url = urlparse(target_url)
+    default_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+
+    normalized_cookies = []
+    skipped = 0
+    for cookie in raw_cookies:
+        if not isinstance(cookie, dict):
+            skipped += 1
+            continue
+        normalized = _normalize_cookie(cookie, default_url)
+        if normalized:
+            normalized_cookies.append(normalized)
+        else:
+            skipped += 1
+
+    if skipped:
+        print(f"ℹ️ تم تجاهل {skipped} كوكي غير صالح")
+
+    return normalized_cookies
+
+
 async def main():
     print("🚀 بدء السكريبت...")
     VIDEO_SCRIPTS_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -273,13 +350,10 @@ async def main():
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
         }""")
 
-        if os.path.exists("cookies.json"):
-            with open("cookies.json", "r", encoding="utf-8") as f:
-                cookies = json.load(f)
+        cookies = load_cookies("cookies.json", GROK_URL)
+        if cookies:
             await context.add_cookies(cookies)
             print(f"🍪 تم حقن {len(cookies)} كوكي")
-        else:
-            print("⚠️ لا يوجد cookies.json – المرة الأولى عادية")
 
         print("🌐 فتح Grok Imagine...")
         await page.goto(GROK_URL, timeout=90000)
